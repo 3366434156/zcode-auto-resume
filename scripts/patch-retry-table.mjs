@@ -36,24 +36,61 @@ const CANDIDATES = [
   path.join(os.homedir(), 'AppData', 'Local', 'Programs', 'ZCode', 'resources', 'glm', 'zcode.cjs'),
 ].filter(Boolean);
 
-const ORIGINAL = 'M9r=[1e3,2e3]';
+// 版本自适应：定位「Start Plan 繁忙」重试表（特征：紧邻 start-plan provider 集合定义的 [1e3,2e3] 数组）
+// 0.16.x: M9r=[1e3,2e3]（1 处）；0.17.x: D3o/U3o=[1e3,2e3]（2 处）。不依赖变量名。
 // 10 档延迟：9 次重试，总等待约 228s
-const PATCHED = 'M9r=[1e3,2e3,5e3,1e4,15e3,3e4,45e3,6e4,6e4,6e4]';
-const MARKER = 'builtin:bigmodel-start-plan';
+const PATCHED_TABLE = '[1e3,2e3,5e3,1e4,15e3,3e4,45e3,6e4,6e4,6e4]';
+
 
 function locate() {
   for (const file of CANDIDATES) {
     if (fs.existsSync(file)) return file;
   }
-  throw new Error('未找到 zcode.cjs，可用 ZCODE_CJS_PATH 环境变量指定路径');
+  throw new Error('未找到 zcode.cjs，可用 ZCODE_CJS_PATH 环境变量或 scripts/.local-paths.json 指定路径');
+}
+
+function findTables(text) {
+  // 匹配 <var>=[1e3,2e3]，且其前 200 字符内出现 start-plan 集合定义，避免误伤无关代码
+  const out = [];
+  const re = /([\w$]+)=\[1e3,2e3(,5e3,1e4,15e3,3e4,45e3,6e4,6e4,6e4)?\]/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const ctx = text.slice(Math.max(0, m.index - 400), m.index + 400);
+    if (ctx.includes('start-plan')) out.push({ start: m.index, end: m.index + m[0].length, full: m[0] });
+  }
+  return out;
 }
 
 function status(file) {
   const text = fs.readFileSync(file, 'utf8');
-  if (!text.includes(MARKER)) return 'unknown';
-  if (text.includes(PATCHED)) return 'patched';
-  if (text.includes(ORIGINAL)) return 'original';
-  return 'unknown';
+  const tables = findTables(text);
+  if (tables.length === 0) return { state: 'not-found', tables };
+  const patched = tables.filter((x) => x.full.includes('5e3'));
+  return { state: patched.length === tables.length ? 'patched' : 'original', tables };
+}
+
+function applyPatch(file) {
+  const backup = file + '.bak';
+  let text = fs.readFileSync(file, 'utf8');
+  const tables = findTables(text);
+  if (tables.length === 0) {
+    console.error('未在 zcode.cjs 中找到 Start Plan 重试表（可能版本更新再次改变了代码），未做修改');
+    process.exit(1);
+  }
+  if (!fs.existsSync(backup)) {
+    fs.copyFileSync(file, backup);
+    console.log('已备份原文件 ->', backup);
+  }
+  // 从后往前替换，避免偏移失效
+  let count = 0;
+  for (let i = tables.length - 1; i >= 0; i -= 1) {
+    const x = tables[i];
+    text = text.slice(0, x.start) + x.full.replace('[1e3,2e3]', PATCHED_TABLE) + text.slice(x.end);
+    count += 1;
+  }
+  fs.writeFileSync(file, text);
+  console.log(`已扩写 ${count} 处重试表：2 次(1s,2s) -> 9 次(1s~60s，约 4 分钟)`);
+  console.log('重启 ZCode 后生效');
 }
 
 const command = process.argv[2] || 'status';
@@ -61,25 +98,12 @@ const file = locate();
 
 if (command === 'status') {
   console.log(`zcode.cjs: ${file}`);
-  console.log(`补丁状态: ${status(file)}`);
+  const s = status(file);
+  console.log(`重试表: ${s.state}（找到 ${s.tables.length} 处）`);
 } else if (command === 'apply') {
-  const current = status(file);
-  if (current === 'patched') {
-    console.log('已是补丁状态，无需重复应用');
-  } else if (current === 'original') {
-    const backup = file + '.bak';
-    if (!fs.existsSync(backup)) {
-      fs.copyFileSync(file, backup);
-      console.log('已备份原文件 ->', backup);
-    }
-    const text = fs.readFileSync(file, 'utf8');
-    fs.writeFileSync(file, text.replace(ORIGINAL, PATCHED));
-    console.log('补丁已应用：Start Plan 繁忙重试表 2 次(1s,2s) -> 9 次(1s~60s，约 4 分钟)');
-    console.log('重启 ZCode 后生效');
-  } else {
-    console.error('zcode.cjs 内容与预期不符（可能版本更新改变了代码），未做修改');
-    process.exit(1);
-  }
+  const s = status(file);
+  if (s.state === 'patched') console.log('已是补丁状态，无需重复应用');
+  else if (s.state === 'original' || s.state === 'not-found') applyPatch(file);
 } else if (command === 'revert') {
   const backup = file + '.bak';
   if (!fs.existsSync(backup)) {
