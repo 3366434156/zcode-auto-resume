@@ -85,18 +85,20 @@
 | `/auto-continue models` | 查看换模型策略、候选模型与 ZCode 当前模型 |
 | `/auto-continue models set <模型1>,<模型2>` | 设置候选模型（按顺序尝试，已试过的不重复） |
 | `/auto-continue fallback on` / `off` | 开 / 关「额度不足自动换模型」 |
-| `/auto-continue switch <模型>` | 立刻尝试切换一次（会真的键入 `/model`，用于验证链路） |
+| `/auto-continue switch <模型>` | 立刻尝试切换一次（会真的点开模型下拉并选中，用于验证链路） |
 
 ## 额度不足自动换模型
 
 订阅额度 / 余额用尽时（`insufficient balance`、错误码 `1113`、「余额不足，请充值」等），重试同一个模型永远不会成功——上游会把这类错误当成永久性错误直接放弃。本插件改成：**先换到列表里的下一个模型，再让会话从中断处继续**。
 
-- **候选模型**：默认 `GLM-5.3 → GLM-5.3-Flash`，可用 `/auto-continue models set` 或 `config.json` 的 `modelFallback.models` 改；只认模型列表里的模型（`GLM-5.3`、`GLM-5.3-Flash` 等），不会去动 Start Plan 这类套餐条目。
+- **候选模型**：默认 `GLM-5.3 → GLM-5.3-Flash`，可用 `/auto-continue models set` 或 `config.json` 的 `modelFallback.models` 改；只认模型列表里的模型（`GLM-5.3`、`GLM-5.3-Flash` 等），不会去动 Start Plan 这类套餐条目。换之前会先读界面上当前的模型，跳过正在报错的那一个。
 - **切换方式**（`modelFallback.strategy`）：
-  - `auto`（默认）— Windows 用 `inject`，其它平台有 `command` 用 `command`，否则 `none`；
-  - `inject` — 用 `scripts/zcode-inject.ps1` 找到 ZCode 窗口、置前，把 `/model <模型>` 键入输入框并回车（无需第三方工具）；
+  - `auto`（默认）— Windows 用 `uia`，其它平台有 `command` 用 `command`，否则 `none`；
+  - `uia` — 用 `scripts/zcode-switch-model.ps1` 走 Windows UI Automation：找到输入框右下角的模型按钮 → 展开下拉 → 按名字精确选中目标 `RadioButton` → 回读按钮文字确认切换成功（不需要第三方工具，也不改 ZCode 文件）；
+  - `type` — 旧思路，把 `injectTemplate`（默认 `/model {model}`）键入输入框。**ZCode 桌面版没有 `/model` 斜杠命令**，仅留作兼容；
   - `command` — 执行自定义命令模板，`{model}` 会被替换，例如接自家运维脚本；
   - `none` — 只检测不切换。
+- **调试脚本**：`scripts/zcode-switch-model.ps1 -QueryOnly` 只读当前模型；`-Probe` 列出下拉里的所有行（类型 / 名字 / 坐标），排错用。
 - **防刷屏**：同一会话最多换 `modelFallback.maxSwitches`（默认 2）次，候选用尽就落回「放弃」并写日志；你手动发消息后计数与已试模型都会清零。
 - 想先观察不真切换：`config.json` 里设 `"modelFallback": { "dryRun": true }`，日志会记录「本来要切到哪个模型」。
 
@@ -140,7 +142,7 @@ ZCode 内置目标循环：`/goal <目标>` 设定后每回合自动校验是否
 | 钩子没触发 | 插件详情页确认两条钩子 runnable；查 Zcode 日志钩子执行记录 |
 | 想看钩子收到了什么 | `config.json` 设 `"debug": true`，看数据目录 `last-input.json` |
 | 误自动继续 / 漏继续 | 调整 `permanentPatterns` / `transientPatterns` / `minErrorCoverage` |
-| 换模型没生效 | 先跑 `powershell -ExecutionPolicy Bypass -File scripts/zcode-inject.ps1 -Probe` 确认能找到 ZCode 窗口（输出 `handle=0x…`）；再 `/auto-continue switch <模型>` 实测一次，看 ZCode 里是否出现 `/model` 命令 |
+| 换模型没生效 | 先跑 `powershell -ExecutionPolicy Bypass -File scripts/zcode-switch-model.ps1 -QueryOnly` 看能否读到当前模型按钮；再 `-Probe` 看下拉里有哪些行、ZCode 用的模型名是否与 `modelFallback.models` 完全一致；最后 `/auto-continue switch <模型>` 实测一次 |
 
 ## 致谢与许可
 

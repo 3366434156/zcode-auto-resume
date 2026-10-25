@@ -85,14 +85,15 @@ Intercepted directly by the UserPromptSubmit hook — **no model call, zero toke
 | `/auto-continue models` | Show fallback strategy, candidate models and ZCode's current model |
 | `/auto-continue models set <m1>,<m2>` | Set candidate models (tried in order, never repeated) |
 | `/auto-continue fallback on` / `off` | Enable / disable balance-triggered model switching |
-| `/auto-continue switch <model>` | Switch once right now (actually types `/model`, useful to verify the link) |
+| `/auto-continue switch <model>` | Switch once right now (opens the model dropdown and selects it, useful to verify the link) |
 
 ## Balance-triggered model fallback
 
 When the subscription quota or balance runs out (`insufficient balance`, error code `1113`, "余额不足，请充值"…), retrying the same model can never succeed — ZCode treats it as a permanent error and gives up. This plugin instead **switches to the next candidate model and lets the session continue from where it broke**.
 
-- **Candidates**: `GLM-5.3 → GLM-5.3-Flash` by default; change with `/auto-continue models set` or `modelFallback.models` in `config.json`. Only real model list entries are used — plan bundles such as Start Plan are never targeted.
-- **Strategy** (`modelFallback.strategy`): `auto` (Windows → `inject`, elsewhere `command` if set, else `none`) · `inject` (focuses the ZCode window via `scripts/zcode-inject.ps1` and types `/model <id>`, no third-party tooling) · `command` (your own template, `{model}` substituted) · `none` (detect only).
+- **Candidates**: `GLM-5.3 → GLM-5.3-Flash` by default; change with `/auto-continue models set` or `modelFallback.models` in `config.json`. Only real model list entries are used — plan bundles such as Start Plan are never targeted. The model currently shown in the UI is read first and skipped, so it never "switches" to the one that just failed.
+- **Strategy** (`modelFallback.strategy`): `auto` (Windows → `uia`, elsewhere `command` if set, else `none`) · `uia` (Windows UI Automation via `scripts/zcode-switch-model.ps1`: opens the model dropdown next to the composer, picks the exact `RadioButton` row by name, then reads the button label back to confirm — no third-party tooling, no ZCode files touched) · `type` (legacy: types `injectTemplate`, default `/model {model}`; **the ZCode desktop app has no `/model` slash command**) · `command` (your own template, `{model}` substituted) · `none` (detect only).
+- **Debug helpers**: `scripts/zcode-switch-model.ps1 -QueryOnly` prints the current model, `-Probe` lists every dropdown row (type / name / rect).
 - **No runaway switching**: at most `modelFallback.maxSwitches` (default 2) per session; when candidates run out it falls back to giving up and says so in the log. Any manual message resets the counters and tried models.
 - Want to watch before enabling? Set `"modelFallback": { "dryRun": true }` in `config.json` — the log records which model it *would* have switched to.
 
