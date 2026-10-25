@@ -144,6 +144,22 @@ ZCode 内置目标循环：`/goal <目标>` 设定后每回合自动校验是否
 | 误自动继续 / 漏继续 | 调整 `permanentPatterns` / `transientPatterns` / `minErrorCoverage` |
 | 换模型没生效 | 先跑 `powershell -ExecutionPolicy Bypass -File scripts/zcode-switch-model.ps1 -QueryOnly` 看能否读到当前模型按钮；再 `-Probe` 看下拉里有哪些行、ZCode 用的模型名是否与 `modelFallback.models` 完全一致；最后 `/auto-continue switch <模型>` 实测一次 |
 
+## 开发与提交
+
+```bash
+git clone git@github.com:3366434156/zcode-auto-resume.git
+git remote add mirror https://ghfast.top/https://github.com/3366434156/zcode-auto-resume.git
+```
+
+直连 GitHub 超时的网络里，`origin` 走不通时可以用镜像读写（`mirror` 是同一个仓库的代理）：
+
+```bash
+git -c http.extraheader="Authorization: Basic $(printf '用户:token' | base64 -w0)" \
+  push mirror HEAD:refs/heads/main
+```
+
+改完 `.ps1` 记得存成 **UTF-8 带 BOM**——PowerShell 5.1 会把无 BOM 的脚本按 GBK 解析，中文注释直接报 `ExpressionsMustBeFirstInPipeline`。
+
 ## 致谢与许可
 
 - [dsh-auto-continue](https://github.com/HsiangNianian/dsh-auto-continue)（MIT）— 错误分类与退避思路
