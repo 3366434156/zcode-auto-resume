@@ -28,7 +28,7 @@
  *   node auto-continue.mjs reset
  *   时长格式：45s / 30m / 2h / 1d，纯数字按分钟。
  */
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -115,23 +115,24 @@ const DEFAULT_CONFIG = {
   /**
    * 余额/额度不足时的换模型行为。
    * strategy：
-   *   auto    — Windows 用 inject，其它平台有 command 就用 command，否则 none
-   *   inject  — 把 /model <模型> 键入 ZCode 输入框（Windows，需要 ZCode 窗口可聚焦）
+   *   auto    — Windows 用 uia（点击模型下拉），其它平台有 command 就用 command，否则 none
+   *   uia     — 用 UI 自动化点击 ZCode 的模型下拉，真正选中目标模型（Windows 默认）
+   *   type    — 把 injectTemplate 打进输入框（旧的 /model 思路，ZCode 桌面版没有该命令，仅留作兼容）
    *   command — 执行 command 模板（可用 {model} 占位符，跨平台）
    *   none    — 不换模型
    */
   modelFallback: {
     enabled: true,
-    /** 候选模型，按顺序尝试，已试过的不再重复。 */
+    /** 候选模型，按顺序尝试，已试过的不再重复；名字要和 ZCode 下拉里的一致。 */
     models: ['GLM-5.3', 'GLM-5.3-Flash'],
     strategy: 'auto',
     /** strategy=command 时执行的命令模板，例如 'nircmd ... {model}'。 */
     command: '',
-    /** strategy=inject 时键入的文本模板。 */
+    /** strategy=type 时键入的文本模板。 */
     injectTemplate: '/model {model}',
-    /** inject 时定位的进程名（Windows 进程，不含 .exe）。 */
+    /** 定位的进程名（Windows 进程，不含 .exe）。 */
     processName: 'ZCode',
-    /** 单次切换命令/注入的超时（毫秒）。 */
+    /** 单次切换的超时（毫秒）。 */
     timeoutMs: 20000,
     /** 切换后等待多久再让会话继续（毫秒），留给 UI 完成切换。 */
     settleMs: 1500,
@@ -539,7 +540,7 @@ async function executeCommand(argsText, state) {
           `额度不足自动换模型: ${fallback.enabled === false ? '已关闭' : '已开启'}`,
           `策略: ${resolveStrategy(fallback)}${fallback.dryRun ? '（dryRun，只记录日志）' : ''}`,
           `候选模型: ${(fallback.models || []).join(' → ') || '未配置'}`,
-          `注入模板: ${fallback.injectTemplate || '/model {model}'}`,
+          `切换方式: ${resolveStrategy(fallback) === 'uia' ? 'UI 自动化点击模型下拉' : resolveStrategy(fallback)}`,
           `自定义命令: ${fallback.command || '未设置'}`,
           '设置候选: /auto-continue models set GLM-5.3,GLM-5.3-Flash',
           '立即切换: /auto-continue switch GLM-5.3    开关: /auto-continue fallback on|off',
@@ -610,24 +611,47 @@ function detectBalance(text, config) {
 function resolveStrategy(fallback) {
   const strategy = String(fallback.strategy || 'auto').toLowerCase();
   if (strategy !== 'auto') return strategy;
-  if (process.platform === 'win32') return 'inject';
+  if (process.platform === 'win32') return 'uia';
   return fallback.command ? 'command' : 'none';
 }
 
-/** 读 ZCode 当前模型（best-effort，只用于日志与候选去重）。 */
+/** 读 ZCode 当前模型：优先读界面上的模型按钮（权威），再退回本地状态/日志。 */
 function readLiveModel() {
+  // 1) 界面：模型按钮文字就是当前主对话模型
+  if (process.platform === 'win32') {
+    try {
+      const script = path.join(pluginRoot(), 'scripts', 'zcode-switch-model.ps1');
+      if (fs.existsSync(script)) {
+        const out = spawnSync(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, '-QueryOnly'],
+          { encoding: 'utf8', timeout: 8000, windowsHide: true },
+        );
+        const text = String((out && out.stdout) || '');
+        const match = /当前模型按钮:\s*'([^']+)'/.exec(text);
+        if (match) {
+          const name = match[1].replace(/\s*(最高|高|中|低|最低)$/, '').trim();
+          log(`[model] 界面当前模型: ${name}`);
+          return { providerId: null, modelId: name };
+        }
+      }
+    } catch {
+      // 继续尝试本地文件
+    }
+  }
+  // 2) 本地状态：只认主对话（main），subagent 覆盖值不代表聊天界面的模型
   try {
     const file = path.join(os.homedir(), '.zcode', 'v2', 'agents-state.json');
     if (fs.existsSync(file)) {
       const state = JSON.parse(fs.readFileSync(file, 'utf8'));
       const overrides = state && state.builtInModelSelectionOverrides;
-      const main = overrides && (overrides.main || overrides['general-purpose']);
+      const main = overrides && overrides.main;
       if (main && main.modelId) return { providerId: main.providerId || null, modelId: main.modelId };
     }
   } catch {
     // 继续尝试日志
   }
-  // 兜底：从最近的 CLI 日志里找最近一次 session.model.updated
+  // 3) 兜底：从最近的 CLI 日志里找最近一次 session.model.updated
   try {
     const logDir = path.join(os.homedir(), '.zcode', 'cli', 'log');
     if (!fs.existsSync(logDir)) return null;
@@ -654,14 +678,24 @@ function readLiveModel() {
   }
 }
 
-/** 选下一个候选模型：只按「本会话已试过」去重（当前模型正是刚失败的那个，不做排除）。 */
+/** 两个模型名是否指同一个模型（忽略「视觉」之类的后缀差异）。 */
+function sameModel(a, b) {
+  const x = String(a || '').trim().toLowerCase();
+  const y = String(b || '').trim().toLowerCase();
+  if (!x || !y) return false;
+  return x === y || x.startsWith(`${y} `) || y.startsWith(`${x} `);
+}
+
+/** 选下一个候选模型：跳过本会话已试过的、以及当前正在用的那个。 */
 function pickFallbackModel(config, session) {
   const fallback = config.modelFallback || {};
   const tried = Array.isArray(session.triedModels) ? session.triedModels : [];
   const maxSwitches = Number.isFinite(fallback.maxSwitches) ? Number(fallback.maxSwitches) : 2;
   if (tried.length >= maxSwitches) return null;
+  const live = readLiveModel();
+  const current = live && live.modelId ? live.modelId : null;
   const candidates = (fallback.models || []).map((m) => String(m || '').trim()).filter(Boolean);
-  return candidates.find((m) => !tried.includes(m)) || null;
+  return candidates.find((m) => !tried.includes(m) && !sameModel(m, current)) || null;
 }
 
 /** 运行子进程，返回 { ok, detail }，绝不抛错。 */
@@ -702,10 +736,25 @@ function runProcess(command, args, timeoutMs) {
   });
 }
 
-/** 键击注入：把 /model <模型> 打进 ZCode 输入框并回车（Windows）。 */
-function switchViaInject(target, fallback) {
+/** UI 自动化：点击 ZCode 的模型下拉并选中目标模型（Windows）。 */
+function switchViaUia(target, fallback) {
   if (process.platform !== 'win32') {
-    return Promise.resolve({ ok: false, detail: 'inject 策略仅支持 Windows' });
+    return Promise.resolve({ ok: false, detail: 'uia 策略仅支持 Windows' });
+  }
+  const script = path.join(pluginRoot(), 'scripts', 'zcode-switch-model.ps1');
+  if (!fs.existsSync(script)) return Promise.resolve({ ok: false, detail: `缺少切换脚本 ${script}` });
+  const args = [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script,
+    '-Model', target,
+  ];
+  if (fallback.processName) args.push('-ProcessName', String(fallback.processName));
+  return runProcess('powershell.exe', args, Number(fallback.timeoutMs) || 20000);
+}
+
+/** 键击注入：把模板文本打进 ZCode 输入框并回车（旧思路，兼容保留）。 */
+function switchViaType(target, fallback) {
+  if (process.platform !== 'win32') {
+    return Promise.resolve({ ok: false, detail: 'type 策略仅支持 Windows' });
   }
   const script = path.join(pluginRoot(), 'scripts', 'zcode-inject.ps1');
   if (!fs.existsSync(script)) return Promise.resolve({ ok: false, detail: `缺少注入脚本 ${script}` });
@@ -737,9 +786,15 @@ async function switchModel(target, fallback) {
     log(`[balance] dryRun：不真正切换到 ${target}（策略 ${strategy}）`);
     return { ok: false, strategy, detail: 'dryRun' };
   }
-  const result = strategy === 'inject'
-    ? await switchViaInject(target, fallback)
-    : await switchViaCommand(target, fallback);
+  let result;
+  if (strategy === 'uia') result = await switchViaUia(target, fallback);
+  else if (strategy === 'type' || strategy === 'inject') result = await switchViaType(target, fallback);
+  else result = await switchViaCommand(target, fallback);
+  if (result.ok) {
+    // 切换成功后等 UI 落盘，再让会话继续，避免下一轮仍用旧模型
+    const settleMs = Number(fallback.settleMs) || 0;
+    if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
+  }
   return { strategy, ...result };
 }
 
