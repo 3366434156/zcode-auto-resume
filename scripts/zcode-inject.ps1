@@ -19,15 +19,19 @@
 .PARAMETER NoEnter
 只输入文本，不按回车。
 
+.PARAMETER Probe
+只探测 ZCode 窗口是否存在并打印句柄与标题，不置前、不输入，用于排错。
+
 .EXAMPLE
 powershell -NoProfile -ExecutionPolicy Bypass -File zcode-inject.ps1 -Text "/model GLM-5.3"
 #>
 [CmdletBinding()]
 param(
-  [Parameter(Mandatory = $true)][string]$Text,
+  [string]$Text = '',
   [string]$ProcessName = 'ZCode',
   [int]$SettleMs = 1500,
-  [switch]$NoEnter
+  [switch]$NoEnter,
+  [switch]$Probe
 )
 
 $ErrorActionPreference = 'Stop'
@@ -79,6 +83,19 @@ for ($i = 0; $i -lt 12; $i++) {
 
 if ($handle -eq [IntPtr]::Zero) {
   [Console]::Error.WriteLine("未找到 $ProcessName 的可见窗口")
+  exit 1
+}
+
+if ($Probe) {
+  $target = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue |
+    Where-Object { $_.MainWindowHandle -eq $handle } | Select-Object -First 1
+  $title = if ($target) { $target.MainWindowTitle } else { '' }
+  Write-Output ("handle=0x{0} title={1}" -f $handle.ToInt64().ToString('X'), $title)
+  exit 0
+}
+
+if ([string]::IsNullOrWhiteSpace($Text)) {
+  [Console]::Error.WriteLine('-Text 不能为空；只想探测窗口请用 -Probe')
   exit 1
 }
 

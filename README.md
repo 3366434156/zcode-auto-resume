@@ -140,6 +140,7 @@ ZCode 内置目标循环：`/goal <目标>` 设定后每回合自动校验是否
 | 钩子没触发 | 插件详情页确认两条钩子 runnable；查 Zcode 日志钩子执行记录 |
 | 想看钩子收到了什么 | `config.json` 设 `"debug": true`，看数据目录 `last-input.json` |
 | 误自动继续 / 漏继续 | 调整 `permanentPatterns` / `transientPatterns` / `minErrorCoverage` |
+| 换模型没生效 | 先跑 `powershell -ExecutionPolicy Bypass -File scripts/zcode-inject.ps1 -Probe` 确认能找到 ZCode 窗口（输出 `handle=0x…`）；再 `/auto-continue switch <模型>` 实测一次，看 ZCode 里是否出现 `/model` 命令 |
 
 ## 致谢与许可
 

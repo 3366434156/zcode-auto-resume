@@ -618,25 +618,50 @@ function resolveStrategy(fallback) {
 function readLiveModel() {
   try {
     const file = path.join(os.homedir(), '.zcode', 'v2', 'agents-state.json');
-    if (!fs.existsSync(file)) return null;
-    const state = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const main = state && state.builtInModelSelectionOverrides && state.builtInModelSelectionOverrides.main;
-    if (main && main.modelId) return { providerId: main.providerId || null, modelId: main.modelId };
+    if (fs.existsSync(file)) {
+      const state = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const overrides = state && state.builtInModelSelectionOverrides;
+      const main = overrides && (overrides.main || overrides['general-purpose']);
+      if (main && main.modelId) return { providerId: main.providerId || null, modelId: main.modelId };
+    }
   } catch {
-    // 读不到不影响主流程
+    // 继续尝试日志
   }
-  return null;
+  // 兜底：从最近的 CLI 日志里找最近一次 session.model.updated
+  try {
+    const logDir = path.join(os.homedir(), '.zcode', 'cli', 'log');
+    if (!fs.existsSync(logDir)) return null;
+    const newest = fs.readdirSync(logDir)
+      .filter((f) => f.endsWith('.jsonl'))
+      .map((f) => ({ f, mtime: fs.statSync(path.join(logDir, f)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime)[0];
+    if (!newest) return null;
+    const file = path.join(logDir, newest.f);
+    const size = fs.statSync(file).size;
+    const start = Math.max(0, size - 256 * 1024);
+    const tail = fs.readFileSync(file, 'utf8').slice(start);
+    let model = null;
+    for (const line of tail.split('\n')) {
+      if (!line.includes('"model":"')) continue;
+      const match = /"model":"((?:[^"\\]|\\.)+)"/.exec(line);
+      if (match) model = match[1];
+    }
+    if (!model) return null;
+    const [providerId, modelId] = model.includes('/') ? model.split('/', 2) : [null, model];
+    return { providerId, modelId };
+  } catch {
+    return null;
+  }
 }
 
-/** 选下一个候选模型：跳过本会话已试过的。 */
+/** 选下一个候选模型：只按「本会话已试过」去重（当前模型正是刚失败的那个，不做排除）。 */
 function pickFallbackModel(config, session) {
   const fallback = config.modelFallback || {};
   const tried = Array.isArray(session.triedModels) ? session.triedModels : [];
   const maxSwitches = Number.isFinite(fallback.maxSwitches) ? Number(fallback.maxSwitches) : 2;
   if (tried.length >= maxSwitches) return null;
   const candidates = (fallback.models || []).map((m) => String(m || '').trim()).filter(Boolean);
-  const live = readLiveModel();
-  return candidates.find((m) => !tried.includes(m) && (!live || live.modelId !== m)) || null;
+  return candidates.find((m) => !tried.includes(m)) || null;
 }
 
 /** 运行子进程，返回 { ok, detail }，绝不抛错。 */
