@@ -1,6 +1,6 @@
 ---
-description: 控制 auto-continue 插件：开关、暂停时长、状态、自定义继续消息
-argument-hint: "[on | off [时长] | pause [时长] | resume | status | msg <文本> | msg clear]"
+description: 控制 auto-continue 插件：开关、暂停时长、状态、自定义继续消息、额度不足自动换模型
+argument-hint: "[on | off [时长] | pause [时长] | resume | status | msg <文本> | msg clear | models [set <模型1>,<模型2>] | fallback on|off | switch <模型>]"
 ---
 
 AUTOCONTINUE_DIRECT: $ARGUMENTS

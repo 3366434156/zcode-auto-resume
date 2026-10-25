@@ -6,7 +6,9 @@
  *   - 临时性错误（系统繁忙 / 限流 / 5xx / 超时 / 网络错误）→ 按自适应退避等待后
  *     输出 {"decision":"block","reason":"继续指令"} 让 Zcode 自动继续一轮；
  *   - 输出截断（未闭合代码块 / 尾部省略号 / 悬空标点）或空响应 → 用对应的恢复文本继续；
- *   - 永久性错误（认证 / 余额 / 模型不存在 / 上下文超限）与正常完成不干预。
+ *   - 余额/额度不足（配额、欠费、insufficient balance…）→ 按 modelFallback 配置自动
+ *     切换到列表里的下一个模型，再让会话继续（见「余额/额度不足 → 自动换模型」一节）；
+ *   - 其它永久性错误（认证 / 模型不存在 / 上下文超限）与正常完成不干预。
  * UserPromptSubmit 事件：
  *   - 拦截 /auto-continue 直连命令（on/off/status/msg/pause），不经过模型、零 token；
  *   - 其余用户新输入视为人工介入，重置该会话的重试计数。
@@ -26,9 +28,11 @@
  *   node auto-continue.mjs reset
  *   时长格式：45s / 30m / 2h / 1d，纯数字按分钟。
  */
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------------------
 // 配置
@@ -101,6 +105,41 @@ const DEFAULT_CONFIG = {
     '连接中断', '连接失败', '请求失败',
     'stream (error|ended unexpectedly|closed)', 'sse error', 'request failed',
   ],
+  /** 余额 / 额度不足类错误：命中后走「换模型 → 继续」流程，而不是像其它永久性错误那样静默跳过。 */
+  balancePatterns: [
+    'insufficient (balance|funds|quota)', 'insufficient_quota', 'insufficient balance', 'no credit',
+    'quota exceeded', 'quota has been exceeded', 'free quota', 'payment required', 'billing',
+    '余额不足', '余额已不足', '欠费', '免费额度', '配额(不足|已用|用尽)', '额度(不足|已用|用尽)', '充值',
+    '\\b1113\\b',
+  ],
+  /**
+   * 余额/额度不足时的换模型行为。
+   * strategy：
+   *   auto    — Windows 用 inject，其它平台有 command 就用 command，否则 none
+   *   inject  — 把 /model <模型> 键入 ZCode 输入框（Windows，需要 ZCode 窗口可聚焦）
+   *   command — 执行 command 模板（可用 {model} 占位符，跨平台）
+   *   none    — 不换模型
+   */
+  modelFallback: {
+    enabled: true,
+    /** 候选模型，按顺序尝试，已试过的不再重复。 */
+    models: ['GLM-5.3', 'GLM-5.3-Flash'],
+    strategy: 'auto',
+    /** strategy=command 时执行的命令模板，例如 'nircmd ... {model}'。 */
+    command: '',
+    /** strategy=inject 时键入的文本模板。 */
+    injectTemplate: '/model {model}',
+    /** inject 时定位的进程名（Windows 进程，不含 .exe）。 */
+    processName: 'ZCode',
+    /** 单次切换命令/注入的超时（毫秒）。 */
+    timeoutMs: 20000,
+    /** 切换后等待多久再让会话继续（毫秒），留给 UI 完成切换。 */
+    settleMs: 1500,
+    /** 同一会话最多换几次模型，防止把候选列表刷穿。 */
+    maxSwitches: 2,
+    /** true 时只记录日志，不真正执行切换（调试用）。 */
+    dryRun: false,
+  },
 };
 
 /** transcript 讨论判定 / 长消息尾部判定共用的严格标记。 */
@@ -126,6 +165,10 @@ function loadConfig() {
       const user = JSON.parse(fs.readFileSync(file, 'utf8'));
       for (const key of Object.keys(DEFAULT_CONFIG)) {
         if (user[key] !== undefined) config[key] = user[key];
+      }
+      // modelFallback 是嵌套对象：逐个字段覆盖，避免用户只写一个键就丢掉其余默认值
+      if (user.modelFallback && typeof user.modelFallback === 'object') {
+        config.modelFallback = { ...DEFAULT_CONFIG.modelFallback, ...user.modelFallback };
       }
     }
   } catch {
@@ -279,11 +322,11 @@ function classifyTruncation(text, config) {
  * 有文本 → 按同样规则分类；无文本 → 'empty'（配合空响应重试）。
  * 只看最后一条，不回溯更早回合，避免旧错误误触发。
  */
-function inspectTranscript(transcriptPath, config) {
-  if (!config.scanTranscript || !transcriptPath) return null;
+/** 只取 transcript 最后一条 assistant 条目的文本；没有该条目时返回 null。 */
+function readLastAssistantText(transcriptPath) {
+  if (!transcriptPath) return null;
   try {
     const lines = fs.readFileSync(transcriptPath, 'utf8').trimEnd().split('\n');
-    let lastAssistantText = null;
     for (let i = lines.length - 1; i >= 0; i -= 1) {
       let entry;
       try {
@@ -295,21 +338,27 @@ function inspectTranscript(transcriptPath, config) {
       const role = message.role || entry.type;
       if (role !== 'assistant') continue;
       const content = message.content;
-      if (typeof content === 'string') lastAssistantText = content;
-      else if (Array.isArray(content)) {
-        lastAssistantText = content
+      if (typeof content === 'string') return content;
+      if (Array.isArray(content)) {
+        return content
           .filter((part) => part && part.type === 'text' && part.text)
           .map((part) => part.text)
           .join(' ');
       }
-      break; // 只看最后一条 assistant 条目
+      return '';
     }
-    if (lastAssistantText === null) return null; // transcript 里没有 assistant 条目，保守放行
-    if (!lastAssistantText.trim()) return config.emptyResponseRetry ? 'empty' : null;
-    return classifyText(lastAssistantText, config);
+    return null; // transcript 里没有 assistant 条目
   } catch {
-    return null; // transcript 不可读时保守放行
+    return null; // transcript 不可读
   }
+}
+
+function inspectTranscript(transcriptPath, config) {
+  if (!config.scanTranscript || !transcriptPath) return null;
+  const lastAssistantText = readLastAssistantText(transcriptPath);
+  if (lastAssistantText === null) return null; // 保守放行
+  if (!lastAssistantText.trim()) return config.emptyResponseRetry ? 'empty' : null;
+  return classifyText(lastAssistantText, config);
 }
 
 /**
@@ -400,10 +449,20 @@ function describeStatus(state, config) {
     lines.push(`已暂停，${new Date(state.pausedUntil).toLocaleString()} 自动恢复（还有 ${formatDuration(state.pausedUntil - Date.now())}）`);
   } else lines.push('运行中');
   lines.push(`自定义继续消息: ${state.customMessage ? `「${state.customMessage}」` : '未设置（使用默认）'}`);
+  const fallback = config.modelFallback || {};
+  const live = readLiveModel();
+  lines.push(`额度不足自动换模型: ${fallback.enabled === false ? '已关闭' : `已开启（策略 ${resolveStrategy(fallback)}${fallback.dryRun ? '，dryRun' : ''}）`}`);
+  lines.push(`候选模型: ${(fallback.models || []).join(' → ') || '未配置'}`);
+  if (live) lines.push(`ZCode 当前模型: ${live.modelId}${live.providerId ? `（${live.providerId}）` : ''}`);
+  if (state.lastModelSwitch) {
+    const s = state.lastModelSwitch;
+    lines.push(`最近换模型: ${s.target} ${s.ok ? '成功' : `失败（${s.detail}）`}  ${new Date(s.at).toLocaleString()}`);
+  }
   const sessions = Object.entries(state.sessions || {});
   lines.push(`会话记录 ${sessions.length} 条:`);
   for (const [id, s] of sessions.slice(0, 10)) {
-    lines.push(`  ${id.slice(0, 12)}…  连续继续 ${s.count} 次 / 重复错误 ${s.repeats} 次  (${new Date(s.updatedAt).toLocaleString()})`);
+    const switched = (s.triedModels || []).length ? `  已换模型 ${(s.triedModels || []).join(',')}` : '';
+    lines.push(`  ${id.slice(0, 12)}…  连续继续 ${s.count} 次 / 重复错误 ${s.repeats} 次${switched}  (${new Date(s.updatedAt).toLocaleString()})`);
   }
   return lines.join('\n');
 }
@@ -414,6 +473,7 @@ function runCommand(argsText, state) {
   const subArgs = rest.join(' ');
   const usage =
     '用法: /auto-continue on | off [时长] | pause [时长] | resume | status | msg <文本> | msg clear\n' +
+    '模型: /auto-continue models | models set <模型1>,<模型2> | fallback on|off | switch <模型>\n' +
     '时长格式: 45s / 30m / 2h / 1d，纯数字按分钟';
 
   switch ((command || 'status').toLowerCase()) {
@@ -466,6 +526,53 @@ function runCommand(argsText, state) {
   }
 }
 
+/** 需要异步或写配置的子命令：models / fallback / switch，其余交给 runCommand。 */
+async function executeCommand(argsText, state) {
+  const tokens = String(argsText || '').trim().split(/\s+/).filter(Boolean);
+  const [command, ...rest] = tokens;
+  const subArgs = rest.join(' ');
+  switch ((command || '').toLowerCase()) {
+    case 'models': {
+      const fallback = loadConfig().modelFallback || {};
+      if (!subArgs) {
+        return [
+          `额度不足自动换模型: ${fallback.enabled === false ? '已关闭' : '已开启'}`,
+          `策略: ${resolveStrategy(fallback)}${fallback.dryRun ? '（dryRun，只记录日志）' : ''}`,
+          `候选模型: ${(fallback.models || []).join(' → ') || '未配置'}`,
+          `注入模板: ${fallback.injectTemplate || '/model {model}'}`,
+          `自定义命令: ${fallback.command || '未设置'}`,
+          '设置候选: /auto-continue models set GLM-5.3,GLM-5.3-Flash',
+          '立即切换: /auto-continue switch GLM-5.3    开关: /auto-continue fallback on|off',
+        ].join('\n');
+      }
+      const [action, ...valueParts] = subArgs.split(/\s+/);
+      if (String(action).toLowerCase() !== 'set') return '用法: /auto-continue models set <模型1>,<模型2>';
+      const models = valueParts.join(' ').split(/[,，]/).map((m) => m.trim()).filter(Boolean);
+      if (!models.length) return '用法: /auto-continue models set <模型1>,<模型2>';
+      patchFallbackConfig({ models });
+      return `候选模型已更新: ${models.join(' → ')}`;
+    }
+    case 'fallback':
+    case 'balance': {
+      const action = String(subArgs || '').trim().toLowerCase();
+      if (!['on', 'off'].includes(action)) return '用法: /auto-continue fallback on|off';
+      const fallback = patchFallbackConfig({ enabled: action === 'on' });
+      return `额度不足自动换模型已${fallback.enabled === false ? '关闭' : '开启'}`;
+    }
+    case 'switch': {
+      const target = String(subArgs || '').trim();
+      if (!target) return '用法: /auto-continue switch <模型名>（立即尝试切换一次）';
+      const config = loadConfig();
+      const result = await switchModel(target, { ...(config.modelFallback || {}), dryRun: false });
+      return result.ok
+        ? `已切换到 ${target}（策略 ${result.strategy}）`
+        : `切换 ${target} 失败（策略 ${result.strategy}）：${result.detail}`;
+    }
+    default:
+      return runCommand(argsText, state);
+  }
+}
+
 function isCommandPrompt(prompt) {
   const trimmed = String(prompt || '').trim();
   for (const prefix of COMMAND_PREFIXES) {
@@ -474,6 +581,214 @@ function isCommandPrompt(prompt) {
     }
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// 余额 / 额度不足 → 自动换模型
+// ---------------------------------------------------------------------------
+
+/** 插件根目录（hooks/ 的上一级），用来定位 scripts/ 下的注入脚本。 */
+function pluginRoot() {
+  try {
+    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  } catch {
+    return process.cwd();
+  }
+}
+
+/** 是否为「余额 / 额度不足」类错误（与普通永久性错误区分开处理）。 */
+function detectBalance(text, config) {
+  const message = String(text || '').trim();
+  if (!message) return false;
+  const patterns = compile(config.balancePatterns || []);
+  if (message.length <= Math.max(config.bannerMaxLength, 200)) return anyMatch(patterns, message);
+  // 长消息要求关键词覆盖率达标，避免把「讨论余额不足」的正常回答误判
+  return matchRatio(patterns, message) >= Math.min(config.minErrorCoverage || 0.2, 0.1);
+}
+
+/** 按 strategy 解析出实际执行方式。 */
+function resolveStrategy(fallback) {
+  const strategy = String(fallback.strategy || 'auto').toLowerCase();
+  if (strategy !== 'auto') return strategy;
+  if (process.platform === 'win32') return 'inject';
+  return fallback.command ? 'command' : 'none';
+}
+
+/** 读 ZCode 当前模型（best-effort，只用于日志与候选去重）。 */
+function readLiveModel() {
+  try {
+    const file = path.join(os.homedir(), '.zcode', 'v2', 'agents-state.json');
+    if (!fs.existsSync(file)) return null;
+    const state = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const main = state && state.builtInModelSelectionOverrides && state.builtInModelSelectionOverrides.main;
+    if (main && main.modelId) return { providerId: main.providerId || null, modelId: main.modelId };
+  } catch {
+    // 读不到不影响主流程
+  }
+  return null;
+}
+
+/** 选下一个候选模型：跳过本会话已试过的。 */
+function pickFallbackModel(config, session) {
+  const fallback = config.modelFallback || {};
+  const tried = Array.isArray(session.triedModels) ? session.triedModels : [];
+  const maxSwitches = Number.isFinite(fallback.maxSwitches) ? Number(fallback.maxSwitches) : 2;
+  if (tried.length >= maxSwitches) return null;
+  const candidates = (fallback.models || []).map((m) => String(m || '').trim()).filter(Boolean);
+  const live = readLiveModel();
+  return candidates.find((m) => !tried.includes(m) && (!live || live.modelId !== m)) || null;
+}
+
+/** 运行子进程，返回 { ok, detail }，绝不抛错。 */
+function runProcess(command, args, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (ok, detail) => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok, detail });
+    };
+    let child;
+    try {
+      child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    } catch (error) {
+      finish(false, `启动失败：${error && error.message}`);
+      return;
+    }
+    let stderr = '';
+    child.stdout.on('data', () => {});
+    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        // 已退出
+      }
+      finish(false, `执行超时（${timeoutMs}ms）`);
+    }, timeoutMs);
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      finish(false, error.message);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      finish(code === 0, (stderr.trim() || `退出码 ${code}`).slice(0, 300));
+    });
+  });
+}
+
+/** 键击注入：把 /model <模型> 打进 ZCode 输入框并回车（Windows）。 */
+function switchViaInject(target, fallback) {
+  if (process.platform !== 'win32') {
+    return Promise.resolve({ ok: false, detail: 'inject 策略仅支持 Windows' });
+  }
+  const script = path.join(pluginRoot(), 'scripts', 'zcode-inject.ps1');
+  if (!fs.existsSync(script)) return Promise.resolve({ ok: false, detail: `缺少注入脚本 ${script}` });
+  const text = String(fallback.injectTemplate || '/model {model}').replaceAll('{model}', target);
+  const args = [
+    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script,
+    '-Text', text, '-SettleMs', String(fallback.settleMs ?? 1500),
+  ];
+  if (fallback.processName) args.push('-ProcessName', String(fallback.processName));
+  return runProcess('powershell.exe', args, Number(fallback.timeoutMs) || 20000);
+}
+
+/** 自定义命令：执行 command 模板，{model} 会被替换。 */
+function switchViaCommand(target, fallback) {
+  const template = String(fallback.command || '');
+  if (!template) return Promise.resolve({ ok: false, detail: 'modelFallback.command 为空' });
+  const text = template.replaceAll('{model}', target);
+  const timeoutMs = Number(fallback.timeoutMs) || 20000;
+  return process.platform === 'win32'
+    ? runProcess('cmd.exe', ['/d', '/s', '/c', text], timeoutMs)
+    : runProcess('/bin/sh', ['-c', text], timeoutMs);
+}
+
+/** 统一入口：按策略切换模型。 */
+async function switchModel(target, fallback) {
+  const strategy = resolveStrategy(fallback);
+  if (strategy === 'none') return { ok: false, strategy, detail: '换模型功能已关闭' };
+  if (fallback.dryRun) {
+    log(`[balance] dryRun：不真正切换到 ${target}（策略 ${strategy}）`);
+    return { ok: false, strategy, detail: 'dryRun' };
+  }
+  const result = strategy === 'inject'
+    ? await switchViaInject(target, fallback)
+    : await switchViaCommand(target, fallback);
+  return { strategy, ...result };
+}
+
+/** 把 modelFallback 的部分字段写回数据目录的 config.json（供 /auto-continue 命令使用）。 */
+function patchFallbackConfig(patch) {
+  const dir = dataDir();
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'config.json');
+  let current = {};
+  try {
+    if (fs.existsSync(file)) current = JSON.parse(fs.readFileSync(file, 'utf8')) || {};
+  } catch {
+    current = {};
+  }
+  const fallback = { ...(current.modelFallback || {}), ...patch };
+  fs.writeFileSync(file, JSON.stringify({ ...current, modelFallback: fallback }, null, 2));
+  return { ...DEFAULT_CONFIG.modelFallback, ...fallback };
+}
+
+/**
+ * 余额 / 额度不足的恢复流程：切换到下一个候选模型，再让会话继续。
+ * @returns {Promise<{continued: boolean, reason?: string}>}
+ */
+async function handleBalanceRecovery(sessionId, session, config, state, errorText) {
+  const fallback = config.modelFallback || {};
+
+  const resetSession = () => {
+    session.count = 0;
+    session.repeats = 0;
+    session.lastHash = '';
+    session.updatedAt = Date.now();
+    saveState(state);
+  };
+
+  if (fallback.enabled === false) {
+    resetSession();
+    log(`[balance] session=${sessionId} 额度不足，但自动换模型已关闭，未继续：${errorText.slice(0, 120)}`);
+    return { continued: false };
+  }
+
+  const target = pickFallbackModel(config, session);
+  if (!target) {
+    resetSession();
+    const tried = (session.triedModels || []).join(' → ') || '无';
+    log(`[balance] session=${sessionId} 额度不足，但候选模型已用尽（已试：${tried}），未继续`);
+    return { continued: false };
+  }
+
+  const switched = await switchModel(target, fallback);
+  session.triedModels = [...(session.triedModels || []), target];
+  session.updatedAt = Date.now();
+  state.lastModelSwitch = {
+    at: Date.now(),
+    sessionId,
+    target,
+    strategy: switched.strategy,
+    ok: switched.ok,
+    detail: switched.detail,
+  };
+  saveState(state);
+
+  if (!switched.ok) {
+    log(`[balance] session=${sessionId} 额度不足 → 切换 ${target} 失败（${switched.strategy}）：${switched.detail}`);
+    return { continued: false };
+  }
+
+  log(`[balance] session=${sessionId} 额度不足 → 已切换到 ${target}（${switched.strategy}），继续会话`);
+  const template = fallback.continueText
+    || '上一轮回复因账户额度 / 余额不足而中断。已自动切换到模型「{model}」，请从中断处继续完成任务，' +
+       '不要重复已完成的步骤；如果上一步的结果不确定，先确认当前状态再继续。';
+  return {
+    continued: true,
+    reason: template.replaceAll('{model}', target).replaceAll('{message}', errorText.slice(0, 200)),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +839,22 @@ async function handleStop(input, config, state) {
   }
 
   if (verdict === 'permanent') {
+    // 额度 / 余额不足：先换模型，再让会话继续；其它永久性错误保持静默跳过
+    const balanceText = lastMessage.trim() || (readLastAssistantText(input.transcriptPath) || '').trim();
+    let balance = false;
+    try {
+      balance = detectBalance(balanceText, config);
+    } catch {
+      balance = false;
+    }
+    if (balance) {
+      const outcome = await handleBalanceRecovery(sessionId, session, config, state, balanceText);
+      if (outcome.continued) {
+        await sleep(Number((config.modelFallback || {}).settleMs ?? 1500));
+        stopContinue(outcome.reason);
+      }
+      return;
+    }
     session.count = 0;
     session.repeats = 0;
     session.updatedAt = Date.now();
@@ -577,7 +908,7 @@ async function handleStop(input, config, state) {
 // 手动 CLI（与 /auto-continue 命令共用逻辑）
 // ---------------------------------------------------------------------------
 
-function runCli(argv) {
+async function runCli(argv) {
   const state = loadState();
   const [command, ...rest] = argv;
   switch ((command || '').toLowerCase()) {
@@ -595,6 +926,11 @@ function runCli(argv) {
       return true;
     case 'msg':
       console.log(runCommand(['msg', ...rest].join(' '), state));
+      return true;
+    case 'models':
+    case 'fallback':
+    case 'switch':
+      console.log(await executeCommand([command, ...rest].join(' '), state));
       return true;
     case 'reset': {
       state.sessions = {};
@@ -622,7 +958,7 @@ function readStdin() {
 async function main() {
   // 手动 CLI 模式：node auto-continue.mjs status|on|off|pause|resume|msg|reset
   const cliArgs = process.argv.slice(2).filter((a) => a && !a.startsWith('-'));
-  if (cliArgs.length && runCli(cliArgs)) return;
+  if (cliArgs.length && (await runCli(cliArgs))) return;
 
   const raw = readStdin();
   let rawInput = {};
@@ -652,18 +988,23 @@ async function main() {
       const commandArgs = isCommandPrompt(input.prompt);
       if (commandArgs !== null) {
         log(`[command] /auto-continue ${commandArgs}`);
-        blockPrompt(runCommand(commandArgs, state));
+        blockPrompt(await executeCommand(commandArgs, state));
         return;
       }
-      // 普通用户新输入：人工介入，重置重试计数
+      // 普通用户新输入：人工介入，重置重试计数与已试模型（用户可能自己换了模型）
       const session = state.sessions[input.sessionId];
-      if (session && (session.count > 0 || session.repeats > 0)) {
+      if (session) {
+        const changed = session.count > 0 || session.repeats > 0
+          || (Array.isArray(session.triedModels) && session.triedModels.length > 0);
         session.count = 0;
         session.repeats = 0;
         session.lastHash = '';
+        session.triedModels = [];
         session.updatedAt = Date.now();
-        saveState(state);
-        log(`[reset] session=${input.sessionId} 用户新输入，重试计数清零`);
+        if (changed) {
+          saveState(state);
+          log(`[reset] session=${input.sessionId} 用户新输入，重试计数与已试模型清零`);
+        }
       }
       return;
     }

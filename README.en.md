@@ -42,7 +42,8 @@ Turns ZCode's most annoying free-tier failure — "**The system is busy. Switch 
 | Timeout / network error / dropped connection | ⏳ Auto-continue |
 | Truncated reply (unclosed code fence, trailing ellipsis) | ✂️ Resume with "continue output, don't repeat" |
 | Empty response | 🔁 Retry with "please reply normally" |
-| Auth failure / no balance / unknown model / context overflow | 🛑 Give up (retrying won't help) |
+| Out of balance / quota (`insufficient balance`, `1113`) | 🔀 **Switch to the next candidate model** and continue |
+| Auth failure / unknown model / context overflow | 🛑 Give up (retrying won't help) |
 | Normal completion / user-initiated stop | ✅ Hands off, retry counters reset |
 
 **Built-in recovery:** error classification (permanent errors detected first and skipped) · adaptive backoff (10s→20s→40s… capped at 60s) · retry cap and loop guard · double false-positive protection (long messages must end with an error banner + keyword coverage threshold + user-discussion detection) · dual field-name compatibility (ZCode camelCase / Claude Code snake_case) · logging and debug dumps.
@@ -81,6 +82,19 @@ Intercepted directly by the UserPromptSubmit hook — **no model call, zero toke
 | `/auto-continue status` | Run state, session counters, custom message |
 | `/auto-continue on` / `off [duration]` | Toggle; timed expiry auto-resumes (`45s / 30m / 2h / 1d`, bare numbers = minutes) |
 | `/auto-continue msg <text>` | Custom continuation with `{count}` `{remaining}` `{message}` placeholders; `msg clear` resets |
+| `/auto-continue models` | Show fallback strategy, candidate models and ZCode's current model |
+| `/auto-continue models set <m1>,<m2>` | Set candidate models (tried in order, never repeated) |
+| `/auto-continue fallback on` / `off` | Enable / disable balance-triggered model switching |
+| `/auto-continue switch <model>` | Switch once right now (actually types `/model`, useful to verify the link) |
+
+## Balance-triggered model fallback
+
+When the subscription quota or balance runs out (`insufficient balance`, error code `1113`, "余额不足，请充值"…), retrying the same model can never succeed — ZCode treats it as a permanent error and gives up. This plugin instead **switches to the next candidate model and lets the session continue from where it broke**.
+
+- **Candidates**: `GLM-5.3 → GLM-5.3-Flash` by default; change with `/auto-continue models set` or `modelFallback.models` in `config.json`. Only real model list entries are used — plan bundles such as Start Plan are never targeted.
+- **Strategy** (`modelFallback.strategy`): `auto` (Windows → `inject`, elsewhere `command` if set, else `none`) · `inject` (focuses the ZCode window via `scripts/zcode-inject.ps1` and types `/model <id>`, no third-party tooling) · `command` (your own template, `{model}` substituted) · `none` (detect only).
+- **No runaway switching**: at most `modelFallback.maxSwitches` (default 2) per session; when candidates run out it falls back to giving up and says so in the log. Any manual message resets the counters and tried models.
+- Want to watch before enabling? Set `"modelFallback": { "dryRun": true }` in `config.json` — the log records which model it *would* have switched to.
 
 ## Known limits & client patches
 
